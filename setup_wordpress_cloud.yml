@@ -1,0 +1,134 @@
+---
+- name: Deploy WordPress Stack with S3 Backups
+  hosts: webservers
+  become: yes
+
+  tasks:
+
+  - name: Install required packages
+    dnf:
+      name:
+        - nginx
+        - mariadb-server
+        - php
+        - php-fpm
+        - php-mysqlnd
+        - php-gd
+        - python3-PyMySQL
+        - wget
+        - tar
+        - awscli
+      state: present
+
+  - name: Start and enable services
+    service:
+      name: "{{ item }}"
+      state: started
+      enabled: yes
+    loop:
+      - nginx
+      - mariadb
+      - php-fpm
+
+  - name: Create web root directory
+    file:
+      path: "{{ project_root }}"
+      state: directory
+      owner: nginx
+      group: nginx
+      mode: '0755'
+      recurse: yes
+
+  - name: Set home directory permission
+    file:
+      path: "/home/{{ system_user }}"
+      mode: '0711'
+
+  - name: Configure PHP-FPM user
+    replace:
+      path: /etc/php-fpm.d/www.conf
+      regexp: "{{ item.regexp }}"
+      replace: "{{ item.replace }}"
+    loop:
+      - { regexp: 'user = apache', replace: 'user = nginx' }
+      - { regexp: 'group = apache', replace: 'group = nginx' }
+
+  - name: Deploy Nginx virtual host
+    copy:
+      dest: "/etc/nginx/conf.d/{{ domain_name }}.conf"
+      content: |
+        server {
+            listen 80;
+            server_name {{ domain_name }};
+            root {{ project_root }};
+            index index.php index.html;
+            location / {
+                try_files $uri $uri/ /index.php?$args;
+            }
+            location ~ \.php$ {
+                include fastcgi_params;
+                fastcgi_pass unix:/run/php-fpm/www.sock;
+                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            }
+        }
+    notify: Restart Nginx
+
+  - name: Download WordPress
+    unarchive:
+      src: https://wordpress.org/latest.tar.gz
+      dest: "{{ project_root }}"
+      remote_src: yes
+      owner: nginx
+      group: nginx
+      extra_opts: [--strip-components=1]
+
+  - name: Create WordPress database
+    mysql_db:
+      name: "{{ db_name }}"
+      state: present
+      login_unix_socket: /var/lib/mysql/mysql.sock
+
+  - name: Create DB user
+    mysql_user:
+      name: "{{ db_user }}"
+      password: "{{ db_pass }}"
+      priv: "{{ db_name }}.*:ALL"
+      state: present
+      login_unix_socket: /var/lib/mysql/mysql.sock
+
+  - name: Enable SELinux home dir hosting
+    seboolean:
+      name: httpd_enable_homedirs
+      state: yes
+      persistent: yes
+
+  - name: Create backup directory
+    file:
+      path: "{{ backup_dir }}"
+      state: directory
+      mode: '0755'
+
+  - name: Create backup script
+    copy:
+      dest: /usr/local/bin/db_backup.sh
+      mode: '0755'
+      content: |
+        #!/bin/bash
+        DATE=$(date +%F-%H-%M)
+        FILE={{ backup_dir }}/wp_$DATE.sql.gz
+        mysqldump {{ db_name }} | gzip > $FILE
+        aws s3 cp $FILE s3://{{ s3_bucket }}/ --region {{ aws_region }}
+        find {{ backup_dir }} -type f -mtime +7 -delete
+
+  - name: Schedule daily backup
+    cron:
+      name: "WordPress DB Backup"
+      minute: "0"
+      hour: "2"
+      job: "/usr/local/bin/db_backup.sh"
+
+  handlers:
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
