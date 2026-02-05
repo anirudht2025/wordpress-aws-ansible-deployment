@@ -71,3 +71,9 @@ This project strengthened my understanding of:
 - HTTPS configuration and web security
 
 ---
+
+## Application Preview
+
+![WordPress Deployment](site-preview.png)
+
+---
